@@ -1,4 +1,4 @@
-name: Custom Android Client Generator
+﻿name: Custom Android Client Generator
 run-name: Custom Android Client Generator
 on: 
   workflow_dispatch:
@@ -100,7 +100,7 @@ jobs:
         with:
           url: "${{ secrets.GENURL }}/cleanzip"
           method: 'POST'
-          customHeaders: '{"Content-Type": "application/json"}'
+          customHeaders: '{"Content-Type": "application/json", "Authorization": "Bearer ${{ env.token }}"}'
           data: '{"uuid": "${{ env.uuid }}"}'
 
       - name: Free Disk Space (Ubuntu)
@@ -319,7 +319,7 @@ jobs:
           sed -i -e 's|const APP_PREFIX: \&str = "rustdesk";|const APP_PREFIX: \&str = "${{ env.appname }}";|' ./libs/portable/src/main.rs
           sed -i -e 's|"RustDesk Remote Desktop"|"${{ env.appname }}"|' ./flutter/windows/runner/Runner.rc
           sed -i -e 's|VALUE "InternalName", "rustdesk" "\0"|VALUE "InternalName", "${{ env.appname }}" "\0"|' ./flutter/windows/runner/Runner.rc
-          sed -i -e 's|"Copyright © 2025 Purslane Ltd. All rights reserved."|"Copyright © 2025"|' ./flutter/windows/runner/Runner.rc
+          sed -i -e 's|"Copyright 漏 2025 Purslane Ltd. All rights reserved."|"Copyright 漏 2025"|' ./flutter/windows/runner/Runner.rc
           sed -i -e 's|"rustdesk.exe"|"${{ env.filename }}"|' ./flutter/windows/runner/Runner.rc
           sed -i -e 's|"RustDesk"|"${{ env.appname }}"|' ./flutter/windows/runner/Runner.rc
           find ./src/lang -name "*.rs" -exec sed -i -e 's|RustDesk|${{ env.appname }}|' {} \;
@@ -603,7 +603,7 @@ jobs:
         with:
           url: "${{ secrets.GENURL }}/cleanzip"
           method: 'POST'
-          customHeaders: '{"Content-Type": "application/json"}'
+          customHeaders: '{"Content-Type": "application/json", "Authorization": "Bearer ${{ env.token }}"}'
           data: '{"uuid": "${{ env.uuid }}"}'
 
       - name: Set rdgen value

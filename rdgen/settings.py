@@ -11,6 +11,7 @@ https://docs.djangoproject.com/en/5.0/ref/settings/
 """
 import os
 from pathlib import Path
+from django.core.exceptions import ImproperlyConfigured
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -19,16 +20,24 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/5.0/howto/deployment/checklist/
 
-# SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = os.environ.get('SECRET_KEY','django-insecure-!(t-!f#6g#sr%yfded9(xha)g+=!6craeez^cp+*&bz_7vdk61')
-GHUSER = os.environ.get("GHUSER", '')
-GHBEARER = os.environ.get("GHBEARER", '')
-GENURL = os.environ.get("GENURL", '')
+def required_env(name):
+    value = os.environ.get(name, '').strip()
+    if not value or value.startswith('replace_with_'):
+        raise ImproperlyConfigured(f"Missing required environment variable: {name}")
+    return value
+
+
+# SECURITY WARNING: keep production secrets out of source control.
+SECRET_KEY = required_env('SECRET_KEY')
+GHUSER = required_env("GHUSER")
+GHBEARER = required_env("GHBEARER")
+GENURL = required_env("GENURL")
 GHBRANCH = os.environ.get("GHBRANCH",'master')
-ZIP_PASSWORD = os.environ.get("ZIP_PASSWORD",'insecure')
+ZIP_PASSWORD = required_env("ZIP_PASSWORD")
+CALLBACK_TOKEN = required_env("CALLBACK_TOKEN")
 PROTOCOL = os.environ.get("PROTOCOL", 'https')
 REPONAME = os.environ.get("REPONAME", 'rdgen')
-SH_SECRET = os.environ.get('SH_SECRET', 'secret')
+SH_SECRET = os.environ.get('SH_SECRET', '').strip()
 
 MEDIA_URL = '/media/'
 MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
@@ -38,8 +47,8 @@ MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
 DEBUG_ENV = os.environ.get("DEBUG", "False")
 DEBUG = DEBUG_ENV.lower() in ['true', '1', 't']
 
-ALLOWED_HOSTS = ['*']
-#CSRF_TRUSTED_ORIGINS = os.getenv('CSRF_TRUSTED_ORIGINS', '').split()
+ALLOWED_HOSTS = [host.strip() for host in os.environ.get("ALLOWED_HOSTS", "rdgen.920813.xyz,localhost,127.0.0.1").split(",") if host.strip()]
+CSRF_TRUSTED_ORIGINS = [origin.strip() for origin in os.environ.get("CSRF_TRUSTED_ORIGINS", "https://rdgen.920813.xyz").split(",") if origin.strip()]
 
 # Application definition
 
@@ -57,7 +66,7 @@ MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
-    #'django.middleware.csrf.CsrfViewMiddleware',
+    'django.middleware.csrf.CsrfViewMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
@@ -90,7 +99,7 @@ WSGI_APPLICATION = 'rdgen.wsgi.application'
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': BASE_DIR / 'db.sqlite3',
+        'NAME': os.environ.get("DB_PATH", BASE_DIR / 'db.sqlite3'),
     }
 }
 
@@ -136,4 +145,5 @@ STATIC_URL = 'static/'
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
-DATA_UPLOAD_MAX_MEMORY_SIZE = None
+DATA_UPLOAD_MAX_NUMBER_FIELDS = 500
+FILE_UPLOAD_MAX_MEMORY_SIZE = 5 * 1024 * 1024

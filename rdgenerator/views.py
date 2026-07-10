@@ -3,6 +3,8 @@ from pathlib import Path
 from django.http import HttpResponse, JsonResponse
 from django.shortcuts import render
 from django.core.files.base import ContentFile
+from django.views.decorators.csrf import csrf_exempt
+from django.views.decorators.http import require_POST
 import os
 import secrets
 import re
@@ -11,22 +13,161 @@ import base64
 import json
 import uuid
 import pyzipper
+import hmac
+import hashlib
+import time
+import mimetypes
 from django.conf import settings as _settings
 from django.db.models import Q
 from .forms import GenerateForm
 from .models import GithubRun
 from PIL import Image
-from urllib.parse import quote
+from django.http import FileResponse, Http404
+
+BOOLEAN_SETTING_FIELDS = {
+    'hideSecuritySettings': 'hide-security-settings',
+    'hideNetworkSettings': 'hide-network-settings',
+    'hideServerSettings': 'hide-server-settings',
+    'hideRemotePrinterSettings': 'hide-remote-printer-settings',
+    'hide_account': 'hide-account',
+    'remove_preset_password_warning': 'remove-preset-password-warning',
+    'hideProxySettings': 'hide-proxy-settings',
+    'hideWebsocketSettings': 'hide-websocket-settings',
+    'collapse_toolbar': 'collapse-toolbar',
+    'privacy_mode': 'privacy-mode',
+    'privacy_wallpaper': 'privacy-wallpaper',
+    'hide_username_on_card': 'hide-username-on-card',
+    'viewOnly': 'view-only',
+    'hide_sensitive_ui': 'hide-sensitive-ui',
+    'hideTray': 'hide-tray',
+    'hidePassword': 'hide-password',
+    'hideMenuBar': 'hide-menu-bar',
+    'hideQuit': 'hide-quit',
+    'hideService_Start_Stop': 'hide-service-start-stop',
+    'allow_numeric_one_time_password': 'allow-numeric-one-time-password',
+    'allowHostnameAsId': 'allow-hostname-as-id',
+    'disable_check_update': 'disable-check-update',
+    'enable_udp_punch': 'enable-udp-punch',
+    'enable_ipv6_punch': 'enable-ipv6-punch',
+    'enable_file_copy_paste': 'enable-file-copy-paste',
+    'sync_init_clipboard': 'sync-init-clipboard',
+    'pre_elevate_service': 'pre-elevate-service',
+    'allowD3dRender': 'allow-d3d-render',
+    'use_texture_render': 'use-texture-render',
+}
+
+OPTION_SETTING_FIELDS = {
+    'image_quality': 'image-quality',
+    'custom_fps': 'custom-fps',
+    'viewport': 'viewport',
+    'view_style': 'view-style',
+    'ui_mode': 'ui-mode',
+    'unlockPin': 'unlock-pin',
+    'passpolicy': 'password-policy',
+}
+
+EXTRA_BOOLEAN_FIELDS = [
+    'cycleMonitor',
+    'xOffline',
+    'removeNewVersionNotif',
+    'hide_chat_voice',
+    'hide_powered_by_me',
+    'addcopy',
+    'disable_install',
+    'no_uninstall',
+    'applyprivacy',
+]
+
+TERMINAL_STATUSES = {'success', 'failure', 'cancelled', 'timed_out', 'skipped', 'action_required'}
+ALLOWED_STATUS_UPDATES = TERMINAL_STATUSES | {'queued', 'in_progress', 'requested', 'waiting', 'completed'}
+
+
+def add_advanced_settings(cleaned_data, target):
+    for field_name, setting_name in BOOLEAN_SETTING_FIELDS.items():
+        if cleaned_data.get(field_name):
+            target[setting_name] = 'Y'
+
+    for field_name, setting_name in OPTION_SETTING_FIELDS.items():
+        value = cleaned_data.get(field_name)
+        if value not in (None, ''):
+            target[setting_name] = str(value)
+
+
+def add_manual_settings(raw_settings, target):
+    for line in raw_settings.splitlines():
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        if '=' not in line:
+            continue
+        k, value = line.split('=', 1)
+        target[k.strip()] = value.strip()
+
+
+def verify_callback_token(request):
+    expected = getattr(_settings, 'CALLBACK_TOKEN', '')
+    if not expected:
+        return True
+    supplied = request.headers.get('Authorization', '').replace('Bearer ', '', 1)
+    return hmac.compare_digest(supplied, expected)
+
+
+def build_zip_token(filename):
+    return hmac.new(
+        _settings.CALLBACK_TOKEN.encode(),
+        filename.encode(),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def safe_uuid(value):
+    try:
+        return str(uuid.UUID(str(value)))
+    except (TypeError, ValueError):
+        raise Http404("Invalid UUID")
+
+
+def generated_dir(build_uuid):
+    return Path('exe') / safe_uuid(build_uuid)
+
+
+def list_generated_files(build_uuid):
+    directory = generated_dir(build_uuid)
+    if not directory.exists():
+        return []
+    return sorted(
+        item.name for item in directory.iterdir()
+        if item.is_file() and not item.name.startswith('.')
+    )
+
+
+def get_latest_workflow_run(workflow_file, headers):
+    time.sleep(3)
+    runs_url = (
+        f"https://api.github.com/repos/{_settings.GHUSER}/{_settings.REPONAME}"
+        f"/actions/workflows/{workflow_file}/runs"
+    )
+    params = {
+        "branch": _settings.GHBRANCH,
+        "event": "workflow_dispatch",
+        "per_page": 1,
+    }
+    response = requests.get(runs_url, headers=headers, params=params, timeout=20)
+    if response.status_code != 200:
+        return {}
+    runs = response.json().get("workflow_runs", [])
+    return runs[0] if runs else {}
 
 def generator_view(request):
     if request.method == 'POST':
         form = GenerateForm(request.POST, request.FILES)
         if form.is_valid():
             user_secret = form.cleaned_data['sh_secret_field']
-            if _settings.SH_SECRET == user_secret:
-                selfhosted = True
-            else:
-                selfhosted = False
+            selfhosted = bool(
+                _settings.SH_SECRET
+                and user_secret
+                and hmac.compare_digest(_settings.SH_SECRET, user_secret)
+            )
             platform = form.cleaned_data['platform']
             version = form.cleaned_data['version']
             delayFix = form.cleaned_data['delayFix']
@@ -35,10 +176,11 @@ def generator_view(request):
             hidecm = form.cleaned_data['hidecm']
             removeNewVersionNotif = form.cleaned_data['removeNewVersionNotif']
             server = form.cleaned_data['serverIP']
-            key = form.cleaned_data['key']
+            key = form.cleaned_data['key'] or form.cleaned_data['RS_PUB_KEY']
             apiServer = form.cleaned_data['apiServer']
             urlLink = form.cleaned_data['urlLink']
             downloadLink = form.cleaned_data['downloadLink']
+            updateLink = form.cleaned_data['updateLink']
             if not server:
                 server = 'rs-ny.rustdesk.com' #default rustdesk server
             if not key:
@@ -134,13 +276,13 @@ def generator_view(request):
 
             ###create the custom.txt json here and send in as inputs below
             decodedCustom = {}
-            if direction != "Both":
+            if direction != "both":
                 decodedCustom['conn-type'] = direction
             if installation == "installationN":
                 decodedCustom['disable-installation'] = 'Y'
             if settings == "settingsN":
                 decodedCustom['disable-settings'] = 'Y'
-            if appname.upper != "rustdesk".upper and appname != "":
+            if appname.upper() != "RUSTDESK" and appname != "":
                 decodedCustom['app-name'] = appname
             decodedCustom['override-settings'] = {}
             decodedCustom['default-settings'] = {}
@@ -179,6 +321,7 @@ def generator_view(request):
                 decodedCustom['default-settings']['enable-remote-printer'] = 'Y' if enablePrinter else 'N'
                 decodedCustom['default-settings']['enable-camera'] = 'Y' if enableCamera else 'N'
                 decodedCustom['default-settings']['enable-terminal'] = 'Y' if enableTerminal else 'N'
+                add_advanced_settings(form.cleaned_data, decodedCustom['default-settings'])
             else:
                 decodedCustom['override-settings']['access-mode'] = permissionsType
                 decodedCustom['override-settings']['enable-keyboard'] = 'Y' if enableKeyboard else 'N'
@@ -198,18 +341,14 @@ def generator_view(request):
                 decodedCustom['override-settings']['enable-remote-printer'] = 'Y' if enablePrinter else 'N'
                 decodedCustom['override-settings']['enable-camera'] = 'Y' if enableCamera else 'N'
                 decodedCustom['override-settings']['enable-terminal'] = 'Y' if enableTerminal else 'N'
+                add_advanced_settings(form.cleaned_data, decodedCustom['override-settings'])
 
-            for line in defaultManual.splitlines():
-                k, value = line.split('=')
-                decodedCustom['default-settings'][k.strip()] = value.strip()
-
-            for line in overrideManual.splitlines():
-                k, value = line.split('=')
-                decodedCustom['override-settings'][k.strip()] = value.strip()
+            add_manual_settings(defaultManual, decodedCustom['default-settings'])
+            add_manual_settings(overrideManual, decodedCustom['override-settings'])
             
-            decodedCustomJson = json.dumps(decodedCustom)
+            decodedCustomJson = json.dumps(decodedCustom, ensure_ascii=False)
 
-            string_bytes = decodedCustomJson.encode("ascii")
+            string_bytes = decodedCustomJson.encode("utf-8")
             base64_bytes = base64.b64encode(string_bytes)
             encodedCustom = base64_bytes.decode("ascii")
 
@@ -229,22 +368,17 @@ def generator_view(request):
             # extra_input = json.dumps(extras)
 
             ####from here run the github action, we need user, repo, access token.
-            if platform == 'windows':
-                url = 'https://api.github.com/repos/'+_settings.GHUSER+'/'+_settings.REPONAME+'/actions/workflows/generator-windows.yml/dispatches'
-                if selfhosted:
-                    url = 'https://api.github.com/repos/'+_settings.GHUSER+'/'+_settings.REPONAME+'/actions/workflows/sh-generator-windows.yml/dispatches'
-            if platform == 'windows-x86':
-                url = 'https://api.github.com/repos/'+_settings.GHUSER+'/'+_settings.REPONAME+'/actions/workflows/generator-windows-x86.yml/dispatches'
-            elif platform == 'linux':
-                url = 'https://api.github.com/repos/'+_settings.GHUSER+'/'+_settings.REPONAME+'/actions/workflows/generator-linux.yml/dispatches'
-            elif platform == 'android':
-                url = 'https://api.github.com/repos/'+_settings.GHUSER+'/'+_settings.REPONAME+'/actions/workflows/generator-android.yml/dispatches'
-            elif platform == 'macos':
-                url = 'https://api.github.com/repos/'+_settings.GHUSER+'/'+_settings.REPONAME+'/actions/workflows/generator-macos.yml/dispatches'
-            else:
-                url = 'https://api.github.com/repos/'+_settings.GHUSER+'/'+_settings.REPONAME+'/actions/workflows/generator-windows.yml/dispatches'
-                if selfhosted:
-                    url = 'https://api.github.com/repos/'+_settings.GHUSER+'/'+_settings.REPONAME+'/actions/workflows/sh-generator-windows.yml/dispatches'
+            workflow_file = {
+                'windows': 'sh-generator-windows.yml' if selfhosted else 'generator-windows.yml',
+                'windows-x86': 'generator-windows-x86.yml',
+                'linux': 'generator-linux.yml',
+                'android': 'generator-android.yml',
+                'macos': 'generator-macos.yml',
+            }.get(platform, 'generator-windows.yml')
+            url = (
+                f"https://api.github.com/repos/{_settings.GHUSER}/{_settings.REPONAME}"
+                f"/actions/workflows/{workflow_file}/dispatches"
+            )
 
             #url = 'https://api.github.com/repos/'+_settings.GHUSER+'/rustdesk/actions/workflows/test.yml/dispatches'  
             inputs_raw = {
@@ -266,6 +400,7 @@ def generator_view(request):
                 "genurl":_settings.GENURL,
                 "urlLink":urlLink,
                 "downloadLink":downloadLink,
+                "updateLink":updateLink,
                 "delayFix": 'true' if delayFix else 'false',
                 "rdgen":'true',
                 "cycleMonitor": 'true' if cycleMonitor else 'false',
@@ -273,11 +408,14 @@ def generator_view(request):
                 "removeNewVersionNotif": 'true' if removeNewVersionNotif else 'false',
                 "compname": compname,
                 "androidappid":androidappid,
-                "filename":filename
+                "filename":filename,
+                "token": _settings.CALLBACK_TOKEN
             }
+            for field_name in EXTRA_BOOLEAN_FIELDS:
+                inputs_raw[field_name] = 'true' if form.cleaned_data.get(field_name) else 'false'
 
             temp_json_path = f"data_{uuid.uuid4()}.json"
-            zip_filename = f"secrets_{uuid.uuid4()}.zip"
+            zip_filename = f"secrets_{myuuid}_{uuid.uuid4()}.zip"
             zip_path = "temp_zips/%s" % (zip_filename)
             Path("temp_zips").mkdir(parents=True, exist_ok=True)
 
@@ -294,6 +432,7 @@ def generator_view(request):
             zipJson = {}
             zipJson['url'] = full_url
             zipJson['file'] = zip_filename
+            zipJson['token'] = build_zip_token(zip_filename)
 
             zip_url = json.dumps(zipJson)
 
@@ -317,19 +456,29 @@ def generator_view(request):
                 status="Starting generator...please wait"
             )
             try:
-                response = requests.post(url, json=data, headers=headers)
+                response = requests.post(url, json=data, headers=headers, timeout=30)
                 #print(response)
                 if response.status_code == 204 or response.status_code == 200:
-                    github_data = response.json()
-                    print(github_data)
+                    github_data = {}
+                    if response.content:
+                        try:
+                            github_data = response.json()
+                        except ValueError:
+                            github_data = {}
+                    if not github_data.get('workflow_run_id'):
+                        latest_run = get_latest_workflow_run(workflow_file, headers)
+                        github_data['workflow_run_id'] = latest_run.get('id')
+                        github_data['html_url'] = latest_run.get('html_url')
+                    if not github_data.get('workflow_run_id'):
+                        return JsonResponse({"error": "GitHub accepted the start request, but the workflow run could not be found yet. Please check Actions manually."}, status=202)
                     new_github_run.github_run_id = github_data.get('workflow_run_id')
                     new_github_run.status = "in_progress"
                     new_github_run.save()
 
-                    return render(request, 'waiting.html', {'filename':filename, 'uuid':myuuid, 'status':"Starting generator...please wait", 'platform':platform, 'log_url': github_data.get('html_url')})
+                    return render(request, 'waiting.html', {'filename':filename, 'uuid':myuuid, 'status':"构建已启动，请稍候", 'platform':platform, 'log_url': github_data.get('html_url')})
                 else:
                     #new_github_run.delete()
-                    return JsonResponse({"error": "GitHub rejected the start request"}, status=500)
+                    return JsonResponse({"error": "GitHub rejected the start request", "detail": response.text}, status=500)
             except Exception as e:
                 #new_github_run.delete()
                 return JsonResponse({"error": f"Connection error: {str(e)}"}, status=500)
@@ -344,7 +493,7 @@ from django.db.models import Q
 
 def check_for_file(request):
     filename = request.GET.get('filename')
-    uuid = request.GET.get('uuid')
+    uuid = safe_uuid(request.GET.get('uuid'))
     platform = request.GET.get('platform')
     gh_run = get_object_or_404(GithubRun, uuid=uuid)
     github_log_url = f"https://github.com/{_settings.GHUSER}/{_settings.REPONAME}/actions/runs/{gh_run.github_run_id}"
@@ -371,7 +520,8 @@ def check_for_file(request):
         return render(request, 'generated.html', {
             'filename': filename, 
             'uuid': uuid, 
-            'platform': platform
+            'platform': platform,
+            'files': list_generated_files(uuid),
         })
         
     elif gh_run.status in ['failure', 'cancelled', 'timed_out', 'skipped', 'action_required']:
@@ -393,25 +543,23 @@ def check_for_file(request):
         })
 
 def download(request):
-    filename = request.GET['filename']
-    uuid = request.GET['uuid']
-    file_path = os.path.join('exe', uuid, filename)
-    with open(file_path, 'rb') as file:
-        content = file.read()
-    response = HttpResponse(content, headers={
-        'Content-Type': 'application/vnd.microsoft.portable-executable',
-        'Content-Disposition': f'attachment; filename="{filename}"'
-    })
-    return response
+    filename = os.path.basename(request.GET['filename'])
+    build_uuid = safe_uuid(request.GET.get('uuid'))
+    get_object_or_404(GithubRun, uuid=build_uuid, status='success')
+    if filename not in list_generated_files(build_uuid):
+        raise Http404("File not found")
+    file_path = generated_dir(build_uuid) / filename
+    content_type = mimetypes.guess_type(filename)[0] or 'application/octet-stream'
+    return FileResponse(open(file_path, 'rb'), as_attachment=True, filename=filename, content_type=content_type)
 
 def get_png(request):
-    filename = request.GET['filename']
-    uuid = request.GET['uuid']
+    filename = os.path.basename(request.GET['filename'])
+    uuid = safe_uuid(request.GET['uuid'])
     #filename = filename+".exe"
     file_path = os.path.join('png',uuid,filename)
     with open(file_path, 'rb') as file:
         response = HttpResponse(file, headers={
-            'Content-Type': 'application/vnd.microsoft.portable-executable',
+            'Content-Type': 'image/png',
             'Content-Disposition': f'attachment; filename="{filename}"'
         })
 
@@ -424,11 +572,17 @@ def create_github_run(myuuid):
     )
     new_github_run.save()
 
+@csrf_exempt
+@require_POST
 def update_github_run(request):
+    if not verify_callback_token(request):
+        return HttpResponse("Unauthorized", status=401)
     data = json.loads(request.body)
     myuuid = data.get('uuid')
     mystatus = data.get('status')
-    GithubRun.objects.filter(Q(uuid=myuuid)).update(status=mystatus)
+    if mystatus not in ALLOWED_STATUS_UPDATES:
+        return HttpResponse("Invalid status", status=400)
+    GithubRun.objects.filter(Q(uuid=safe_uuid(myuuid))).update(status=mystatus)
     return HttpResponse('')
 
 def resize_and_encode_icon(imagefile):
@@ -471,7 +625,11 @@ def resize_and_encode_icon(imagefile):
     return resized64
  
 #the following is used when accessed from an external source, like the rustdesk api server
+@csrf_exempt
+@require_POST
 def startgh(request):
+    if not verify_callback_token(request):
+        return HttpResponse("Unauthorized", status=401)
     #print(request)
     data_ = json.loads(request.body)
     ####from here run the github action, we need user, repo, access token.
@@ -527,10 +685,18 @@ def save_png(file, uuid, domain, name):
     #return "%s/%s" % (domain, file_save_path)
     return domain, uuid, name
 
+@csrf_exempt
+@require_POST
 def save_custom_client(request):
+    if not verify_callback_token(request):
+        return HttpResponse("Unauthorized", status=401)
+    if 'file' not in request.FILES or not request.POST.get('uuid'):
+        return HttpResponse("Missing file or uuid", status=400)
     file = request.FILES['file']
-    myuuid = request.POST.get('uuid')
-    file_save_path = "exe/%s/%s" % (myuuid, file.name)
+    myuuid = safe_uuid(request.POST.get('uuid'))
+    if not GithubRun.objects.filter(uuid=myuuid).exists():
+        return HttpResponse("Unknown build UUID", status=404)
+    file_save_path = "exe/%s/%s" % (myuuid, os.path.basename(file.name))
     Path("exe/%s" % myuuid).mkdir(parents=True, exist_ok=True)
     with open(file_save_path, "wb+") as f:
         for chunk in file.chunks():
@@ -538,7 +704,11 @@ def save_custom_client(request):
 
     return HttpResponse("File saved successfully!")
 
+@csrf_exempt
+@require_POST
 def cleanup_secrets(request):
+    if not verify_callback_token(request):
+        return HttpResponse("Unauthorized", status=401)
     # Pass the UUID as a query param or in JSON body
     data = json.loads(request.body)
     my_uuid = data.get('uuid')
@@ -562,12 +732,17 @@ def cleanup_secrets(request):
     return HttpResponse("Cleanup successful", status=200)
 
 def get_zip(request):
-    filename = request.GET['filename']
+    filename = os.path.basename(request.GET['filename'])
+    token = request.GET.get('token', '')
+    if not hmac.compare_digest(token, build_zip_token(filename)):
+        return HttpResponse("Unauthorized", status=401)
     #filename = filename+".exe"
     file_path = os.path.join('temp_zips',filename)
+    if not os.path.exists(file_path):
+        raise Http404("Zip not found")
     with open(file_path, 'rb') as file:
         response = HttpResponse(file, headers={
-            'Content-Type': 'application/vnd.microsoft.portable-executable',
+            'Content-Type': 'application/zip',
             'Content-Disposition': f'attachment; filename="{filename}"'
         })
 

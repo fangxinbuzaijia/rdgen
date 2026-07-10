@@ -1,4 +1,4 @@
-name: Custom Linux Client Generator
+﻿name: Custom Linux Client Generator
 run-name: Custom Linux Client Generator
 on: 
   workflow_dispatch:
@@ -887,7 +887,7 @@ jobs:
         with:
           url: "${{ secrets.GENURL }}/cleanzip"
           method: 'POST'
-          customHeaders: '{"Content-Type": "application/json"}'
+          customHeaders: '{"Content-Type": "application/json", "Authorization": "Bearer ${{ env.token }}"}'
           data: '{"uuid": "${{ env.uuid }}"}'
 
       - name: Set rdgen value
@@ -915,3 +915,4 @@ jobs:
         uses: geekyeggo/delete-artifact@v5
         with:
           name: encrypted-secrets-zip
+
