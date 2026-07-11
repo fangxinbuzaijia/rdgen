@@ -98,7 +98,16 @@
             border-color: var(--accent);
             box-shadow: 0 0 0 1px var(--accent) inset;
         }
+        .platform-icon.active::after {
+            content: "✓";
+            position: absolute;
+            top: 6px;
+            right: 8px;
+            color: var(--accent-2);
+            font-weight: 700;
+        }
         .platform-icon i { font-size: 28px; }
+        .platform-select { display: none; }
         .badge {
             position: absolute;
             right: 8px;
@@ -250,18 +259,18 @@
         <section class="section full">
             <h2><i class="fas fa-desktop"></i> 平台与版本</h2>
             <div class="platform-icons">
-                <div class="platform-icon active" data-platform="windows"><i class="fab fa-windows"></i><span class="badge">64</span></div>
-                <div class="platform-icon" data-platform="windows-x86"><i class="fab fa-windows"></i><span class="badge">32</span></div>
-                <div class="platform-icon" data-platform="linux"><i class="fab fa-linux"></i></div>
-                <div class="platform-icon" data-platform="android"><i class="fab fa-android"></i></div>
-                <div class="platform-icon" data-platform="macos"><i class="fab fa-apple"></i></div>
+                <div class="platform-icon" data-platform="windows" role="button" tabindex="0" aria-pressed="false"><i class="fab fa-windows"></i><span class="badge">64</span></div>
+                <div class="platform-icon" data-platform="windows-x86" role="button" tabindex="0" aria-pressed="false"><i class="fab fa-windows"></i><span class="badge">32</span></div>
+                <div class="platform-icon" data-platform="linux" role="button" tabindex="0" aria-pressed="false"><i class="fab fa-linux"></i></div>
+                <div class="platform-icon" data-platform="android" role="button" tabindex="0" aria-pressed="false"><i class="fab fa-android"></i></div>
+                <div class="platform-icon" data-platform="macos" role="button" tabindex="0" aria-pressed="false"><i class="fab fa-apple"></i></div>
             </div>
             <div class="grid three">
-                <div class="field"><label>构建平台</label>{{ form.platform }}</div>
+                <div class="field platform-select"><label>构建平台</label>{{ form.platform }}</div>
                 <div class="field"><label>RustDesk 版本</label>{{ form.version }}</div>
                 <label class="inline-check">{{ form.delayFix }} 修复使用第三方 API 时的连接延迟</label>
             </div>
-            <p class="hint">`master/nightly` 功能最新但稳定性较低，生产环境建议优先选择正式版本。</p>
+            <p class="hint">平台可多选，将分别创建独立的 GitHub Actions 构建任务。`master/nightly` 功能最新但稳定性较低。</p>
         </section>
 
         <section class="section">
@@ -454,12 +463,34 @@ function setMode(mode) {
 basicModeBtn.addEventListener('click', () => setMode('basic'));
 advancedModeBtn.addEventListener('click', () => setMode('advanced'));
 
+const platformSelect = document.getElementById('id_platform');
+
+function syncPlatformIcons() {
+    const selected = new Set(Array.from(platformSelect.selectedOptions, option => option.value));
+    document.querySelectorAll('.platform-icon').forEach(icon => {
+        const active = selected.has(icon.dataset.platform);
+        icon.classList.toggle('active', active);
+        icon.setAttribute('aria-pressed', String(active));
+    });
+}
+
+function togglePlatform(icon) {
+    const option = Array.from(platformSelect.options).find(item => item.value === icon.dataset.platform);
+    if (!option) return;
+    const selectedCount = platformSelect.selectedOptions.length;
+    if (option.selected && selectedCount === 1) return;
+    option.selected = !option.selected;
+    syncPlatformIcons();
+    updateSummary();
+}
+
 document.querySelectorAll('.platform-icon').forEach(icon => {
-    icon.addEventListener('click', () => {
-        document.querySelectorAll('.platform-icon').forEach(item => item.classList.remove('active'));
-        icon.classList.add('active');
-        document.getElementById('id_platform').value = icon.dataset.platform;
-        updateSummary();
+    icon.addEventListener('click', () => togglePlatform(icon));
+    icon.addEventListener('keydown', event => {
+        if (event.key === 'Enter' || event.key === ' ') {
+            event.preventDefault();
+            togglePlatform(icon);
+        }
     });
 });
 
@@ -473,7 +504,8 @@ function selectedText(id) {
 }
 
 function updateSummary() {
-    document.getElementById('summaryPlatform').textContent = selectedText('id_platform') || 'Windows 64 位';
+    const platforms = Array.from(platformSelect.selectedOptions, option => option.text);
+    document.getElementById('summaryPlatform').textContent = platforms.join('、') || 'Windows 64 位';
     document.getElementById('summaryVersion').textContent = selectedText('id_version') || '1.4.8';
     document.getElementById('summaryName').textContent = selectedText('id_exename') || '未填写';
     document.getElementById('summaryServer').textContent = selectedText('id_serverIP') || '默认 RustDesk';
@@ -485,6 +517,7 @@ function updateSummary() {
     if (element) element.addEventListener('change', updateSummary);
 });
 updateSummary();
+syncPlatformIcons();
 
 function bindPreview(fieldId, previewId, hiddenId) {
     const field = document.getElementById(fieldId);
@@ -529,6 +562,8 @@ async function saveFormData() {
             data[element.name] = element.checked;
         } else if (element.type === 'radio') {
             if (element.checked) data[element.name] = element.value;
+        } else if (element.multiple) {
+            data[element.name] = Array.from(element.selectedOptions, option => option.value);
         } else {
             data[element.name] = element.value;
         }
@@ -559,6 +594,11 @@ fileInput.addEventListener('change', event => {
                         element.checked = Boolean(value);
                     } else if (element.type === 'radio') {
                         element.checked = element.value === String(value);
+                    } else if (element.multiple) {
+                        const selected = new Set(Array.isArray(value) ? value : [value]);
+                        Array.from(element.options).forEach(option => {
+                            option.selected = selected.has(option.value);
+                        });
                     } else if (element.type !== 'file') {
                         element.value = value;
                     }
@@ -577,6 +617,8 @@ fileInput.addEventListener('change', event => {
                     document.getElementById('privacy-preview').innerHTML = `<img src="${value}" alt="">`;
                 }
             });
+            syncPlatformIcons();
+            updateSummary();
         } catch {
             alert('配置文件不是有效的 JSON。');
         }

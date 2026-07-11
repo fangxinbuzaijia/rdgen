@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>多平台构建进度</title>
+    <style>
+        :root {
+            color-scheme: dark;
+            --bg: #0b0d10;
+            --panel: #151922;
+            --line: #2a3140;
+            --text: #eef2f7;
+            --muted: #a9b3c3;
+            --blue: #2f80ed;
+            --green: #22c55e;
+            --red: #ef4444;
+        }
+        * { box-sizing: border-box; }
+        body {
+            margin: 0;
+            padding: 24px;
+            background: var(--bg);
+            color: var(--text);
+            font-family: "Microsoft YaHei", "PingFang SC", Arial, sans-serif;
+        }
+        main { width: min(980px, 100%); margin: 0 auto; }
+        h1 { margin: 0; font-size: 28px; letter-spacing: 0; }
+        .intro { color: var(--muted); line-height: 1.7; }
+        .jobs {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 14px;
+            margin-top: 22px;
+        }
+        .job {
+            min-width: 0;
+            padding: 18px;
+            border: 1px solid var(--line);
+            border-radius: 8px;
+            background: var(--panel);
+        }
+        .job-head { display: flex; justify-content: space-between; gap: 12px; align-items: center; }
+        .job h2 { margin: 0; font-size: 18px; letter-spacing: 0; }
+        .status { color: #8bc0ff; font-size: 13px; }
+        .job.success { border-color: rgba(34, 197, 94, .7); }
+        .job.success .status { color: #7ee29b; }
+        .job.failure { border-color: rgba(239, 68, 68, .7); }
+        .job.failure .status { color: #ff9a9a; }
+        .error { color: #ffaaaa; line-height: 1.6; }
+        .links { display: grid; gap: 8px; margin-top: 14px; }
+        a {
+            color: #8bc0ff;
+            text-decoration: none;
+            overflow-wrap: anywhere;
+        }
+        a.download {
+            display: block;
+            padding: 10px 12px;
+            border-radius: 6px;
+            background: var(--blue);
+            color: white;
+        }
+        .footer { margin-top: 24px; }
+        .footer a {
+            display: inline-block;
+            padding: 10px 14px;
+            border: 1px solid var(--line);
+            border-radius: 6px;
+        }
+        @media (max-width: 600px) {
+            body { padding: 16px; }
+            h1 { font-size: 23px; }
+            .jobs { grid-template-columns: 1fr; }
+        }
+    </style>
+</head>
+<body>
+<main>
+    <h1>多平台构建已提交</h1>
+    <p class="intro">配置名称：{{ filename }}。每个平台是独立任务，完成时间可能不同；本页会每 30 秒自动更新。</p>
+    <div class="jobs">
+        {% for job in jobs %}
+            <section class="job{% if job.status == 'dispatch_failed' %} failure{% endif %}" data-uuid="{{ job.uuid }}" data-status="{{ job.status }}">
+                <div class="job-head">
+                    <h2>{{ job.platform_label }}</h2>
+                    <span class="status">{% if job.status == 'dispatch_failed' %}提交失败{% else %}构建中{% endif %}</span>
+                </div>
+                {% if job.error %}<p class="error">{{ job.error }}</p>{% endif %}
+                <div class="links">
+                    {% if job.log_url %}<a class="log" href="{{ job.log_url }}" target="_blank" rel="noopener">查看 GitHub Actions 日志</a>{% endif %}
+                </div>
+            </section>
+        {% endfor %}
+    </div>
+    <div class="footer"><a href="/">返回构建器</a></div>
+</main>
+<script>
+const terminalStatuses = new Set(['success', 'failure', 'cancelled', 'timed_out', 'skipped', 'action_required', 'dispatch_failed']);
+const statusLabels = {
+    queued: '排队中', requested: '等待启动', waiting: '等待运行',
+    in_progress: '构建中', success: '构建成功', failure: '构建失败',
+    cancelled: '已取消', timed_out: '已超时', skipped: '已跳过',
+    action_required: '需要人工处理', dispatch_failed: '提交失败'
+};
+
+function renderJob(card, data) {
+    card.dataset.status = data.status;
+    card.querySelector('.status').textContent = statusLabels[data.status] || data.status;
+    card.classList.toggle('success', data.status === 'success');
+    card.classList.toggle('failure', terminalStatuses.has(data.status) && data.status !== 'success');
+    const links = card.querySelector('.links');
+    if (data.log_url && !links.querySelector('.log')) {
+        const log = document.createElement('a');
+        log.className = 'log';
+        log.href = data.log_url;
+        log.target = '_blank';
+        log.rel = 'noopener';
+        log.textContent = '查看 GitHub Actions 日志';
+        links.appendChild(log);
+    }
+    if (data.status === 'success' && !links.querySelector('.download')) {
+        data.files.forEach(filename => {
+            const link = document.createElement('a');
+            link.className = 'download';
+            link.href = `/download?filename=${encodeURIComponent(filename)}&uuid=${encodeURIComponent(data.uuid)}`;
+            link.textContent = `下载 ${filename}`;
+            links.appendChild(link);
+        });
+    }
+}
+
+async function refreshJobs() {
+    const activeCards = Array.from(document.querySelectorAll('.job')).filter(
+        card => !terminalStatuses.has(card.dataset.status)
+    );
+    await Promise.all(activeCards.map(async card => {
+        try {
+            const response = await fetch(`/build_status?uuid=${encodeURIComponent(card.dataset.uuid)}`, {cache: 'no-store'});
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            renderJob(card, await response.json());
+        } catch (error) {
+            card.querySelector('.status').textContent = '状态查询暂时失败';
+        }
+    }));
+    if (Array.from(document.querySelectorAll('.job')).some(card => !terminalStatuses.has(card.dataset.status))) {
+        window.setTimeout(refreshJobs, 30000);
+    }
+}
+
+window.setTimeout(refreshJobs, 3000);
+</script>
+</body>
+</html>

@@ -6,10 +6,26 @@ MAX_IMAGE_BYTES = 5 * 1024 * 1024
 class GenerateForm(forms.Form):
     sh_secret_field = forms.CharField(required=False)
     #Platform
-    platform = forms.ChoiceField(choices=[('windows','Windows 64 位'),('windows-x86','Windows 32 位'),('linux','Linux'),('android','Android'),('macos','macOS')], initial='windows')
+    platform = forms.MultipleChoiceField(
+        choices=[
+            ('windows', 'Windows 64 位'),
+            ('windows-x86', 'Windows 32 位'),
+            ('linux', 'Linux'),
+            ('android', 'Android'),
+            ('macos', 'macOS'),
+        ],
+        initial=['windows'],
+        widget=forms.SelectMultiple,
+    )
     version = forms.ChoiceField(choices=[('master','nightly'),('1.4.8','1.4.8'),('1.4.7','1.4.7'),('1.4.6','1.4.6'),('1.4.5','1.4.5'),('1.4.4','1.4.4'),('1.4.3','1.4.3'),('1.4.2','1.4.2'),('1.4.1','1.4.1'),('1.4.0','1.4.0'),('1.3.9','1.3.9'),('1.3.8','1.3.8'),('1.3.7','1.3.7'),('1.3.6','1.3.6'),('1.3.5','1.3.5'),('1.3.4','1.3.4'),('1.3.3','1.3.3')], initial='1.4.8')
     help_text="'master' 是开发版，功能最新但稳定性可能较低"
     delayFix = forms.BooleanField(initial=True, required=False)
+
+    def clean_platform(self):
+        platforms = list(dict.fromkeys(self.cleaned_data['platform']))
+        if len(platforms) > 5:
+            raise forms.ValidationError('一次最多构建 5 个平台。')
+        return platforms
 
     #General
     exename = forms.CharField(label="Name for EXE file", required=True)

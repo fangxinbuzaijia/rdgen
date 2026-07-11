@@ -17,6 +17,7 @@ import hmac
 import hashlib
 import time
 import mimetypes
+import copy
 from django.conf import settings as _settings
 from django.db.models import Q
 from .forms import GenerateForm
@@ -80,6 +81,14 @@ EXTRA_BOOLEAN_FIELDS = [
 
 TERMINAL_STATUSES = {'success', 'failure', 'cancelled', 'timed_out', 'skipped', 'action_required'}
 ALLOWED_STATUS_UPDATES = TERMINAL_STATUSES | {'queued', 'in_progress', 'requested', 'waiting', 'completed'}
+
+PLATFORM_LABELS = {
+    'windows': 'Windows 64 位',
+    'windows-x86': 'Windows 32 位',
+    'linux': 'Linux',
+    'android': 'Android',
+    'macos': 'macOS',
+}
 
 
 def add_advanced_settings(cleaned_data, target):
@@ -158,6 +167,130 @@ def get_latest_workflow_run(workflow_file, headers):
     runs = response.json().get("workflow_runs", [])
     return runs[0] if runs else {}
 
+
+def workflow_for_platform(platform, selfhosted=False):
+    workflows = {
+        'windows': 'sh-generator-windows.yml' if selfhosted else 'generator-windows.yml',
+        'windows-x86': 'generator-windows-x86.yml',
+        'linux': 'generator-linux.yml',
+        'android': 'generator-android.yml',
+        'macos': 'generator-macos.yml',
+    }
+    return workflows[platform]
+
+
+def encode_custom_for_platform(decoded_custom, platform, theme, theme_mode):
+    platform_custom = copy.deepcopy(decoded_custom)
+    for settings_group in ('default-settings', 'override-settings'):
+        platform_custom[settings_group].pop('theme', None)
+        platform_custom[settings_group].pop('allow-darktheme', None)
+
+    if theme != 'system':
+        target_group = 'default-settings' if theme_mode == 'default' else 'override-settings'
+        if platform == 'windows-x86':
+            platform_custom[target_group]['allow-darktheme'] = 'Y' if theme == 'dark' else 'N'
+        else:
+            platform_custom[target_group]['theme'] = theme
+
+    raw = json.dumps(platform_custom, ensure_ascii=False).encode('utf-8')
+    return base64.b64encode(raw).decode('ascii')
+
+
+def dispatch_platform_build(platform, version, full_url, inputs_raw, selfhosted):
+    build_uuid = inputs_raw['uuid']
+    workflow_file = workflow_for_platform(platform, selfhosted)
+    workflow_url = (
+        f"https://api.github.com/repos/{_settings.GHUSER}/{_settings.REPONAME}"
+        f"/actions/workflows/{workflow_file}/dispatches"
+    )
+    zip_filename = f"secrets_{build_uuid}_{uuid.uuid4()}.zip"
+    zip_path = Path('temp_zips') / zip_filename
+    temp_json_path = Path(f"data_{uuid.uuid4()}.json")
+    zip_path.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        with temp_json_path.open('w', encoding='utf-8') as output:
+            json.dump(inputs_raw, output, ensure_ascii=False)
+        with pyzipper.AESZipFile(
+            zip_path,
+            'w',
+            compression=pyzipper.ZIP_LZMA,
+            encryption=pyzipper.WZ_AES,
+        ) as archive:
+            archive.setpassword(_settings.ZIP_PASSWORD.encode())
+            archive.write(temp_json_path, arcname='secrets.json')
+    finally:
+        temp_json_path.unlink(missing_ok=True)
+
+    zip_url = json.dumps({
+        'url': full_url,
+        'file': zip_filename,
+        'token': build_zip_token(zip_filename),
+    })
+    data = {
+        'ref': _settings.GHBRANCH,
+        'inputs': {
+            'version': version,
+            'zip_url': zip_url,
+        },
+        'return_run_details': True,
+    }
+    headers = {
+        'Accept': 'application/vnd.github+json',
+        'Content-Type': 'application/json',
+        'Authorization': f'Bearer {_settings.GHBEARER}',
+        'X-GitHub-Api-Version': '2026-03-10',
+    }
+    job = {
+        'uuid': build_uuid,
+        'platform': platform,
+        'platform_label': PLATFORM_LABELS[platform],
+        'status': 'dispatching',
+        'log_url': '',
+        'error': '',
+    }
+
+    try:
+        response = requests.post(workflow_url, json=data, headers=headers, timeout=30)
+        if response.status_code not in (200, 204):
+            zip_path.unlink(missing_ok=True)
+            job['status'] = 'dispatch_failed'
+            job['error'] = f"GitHub 拒绝启动任务（HTTP {response.status_code}）"
+            return job
+
+        github_data = {}
+        if response.content:
+            try:
+                github_data = response.json()
+            except ValueError:
+                pass
+        if not github_data.get('workflow_run_id'):
+            latest_run = get_latest_workflow_run(workflow_file, headers)
+            github_data['workflow_run_id'] = latest_run.get('id')
+            github_data['html_url'] = latest_run.get('html_url')
+        if not github_data.get('workflow_run_id'):
+            job['status'] = 'dispatch_failed'
+            job['error'] = 'GitHub 已接收任务，但暂时无法取得运行编号，请到 Actions 页面确认。'
+            return job
+
+        github_run = GithubRun(
+            uuid=build_uuid,
+            status='in_progress',
+            github_run_id=github_data['workflow_run_id'],
+        )
+        github_run.save()
+        job['status'] = 'in_progress'
+        job['log_url'] = github_data.get('html_url') or (
+            f"https://github.com/{_settings.GHUSER}/{_settings.REPONAME}"
+            f"/actions/runs/{github_data['workflow_run_id']}"
+        )
+        return job
+    except requests.RequestException as exc:
+        zip_path.unlink(missing_ok=True)
+        job['status'] = 'dispatch_failed'
+        job['error'] = f'连接 GitHub 失败：{exc}'
+        return job
+
 def generator_view(request):
     if request.method == 'POST':
         form = GenerateForm(request.POST, request.FILES)
@@ -168,7 +301,8 @@ def generator_view(request):
                 and user_secret
                 and hmac.compare_digest(_settings.SH_SECRET, user_secret)
             )
-            platform = form.cleaned_data['platform']
+            platforms = form.cleaned_data['platform']
+            platform = platforms[0]
             version = form.cleaned_data['version']
             delayFix = form.cleaned_data['delayFix']
             cycleMonitor = form.cleaned_data['cycleMonitor']
@@ -346,142 +480,69 @@ def generator_view(request):
             add_manual_settings(defaultManual, decodedCustom['default-settings'])
             add_manual_settings(overrideManual, decodedCustom['override-settings'])
             
-            decodedCustomJson = json.dumps(decodedCustom, ensure_ascii=False)
+            jobs = []
+            for index, selected_platform in enumerate(platforms):
+                build_uuid = myuuid if index == 0 else str(uuid.uuid4())
+                inputs_raw = {
+                    'server': server,
+                    'key': key,
+                    'apiServer': apiServer,
+                    'custom': encode_custom_for_platform(
+                        decodedCustom,
+                        selected_platform,
+                        theme,
+                        themeDorO,
+                    ),
+                    'uuid': build_uuid,
+                    'iconlink_url': iconlink_url,
+                    'iconlink_uuid': iconlink_uuid,
+                    'iconlink_file': iconlink_file,
+                    'logolink_url': logolink_url,
+                    'logolink_uuid': logolink_uuid,
+                    'logolink_file': logolink_file,
+                    'privacylink_url': privacylink_url,
+                    'privacylink_uuid': privacylink_uuid,
+                    'privacylink_file': privacylink_file,
+                    'appname': appname,
+                    'genurl': _settings.GENURL,
+                    'urlLink': urlLink,
+                    'downloadLink': downloadLink,
+                    'updateLink': updateLink,
+                    'delayFix': 'true' if delayFix else 'false',
+                    'rdgen': 'true',
+                    'cycleMonitor': 'true' if cycleMonitor else 'false',
+                    'xOffline': 'true' if xOffline else 'false',
+                    'removeNewVersionNotif': 'true' if removeNewVersionNotif else 'false',
+                    'compname': compname,
+                    'androidappid': androidappid,
+                    'filename': filename,
+                    'token': _settings.CALLBACK_TOKEN,
+                }
+                for field_name in EXTRA_BOOLEAN_FIELDS:
+                    inputs_raw[field_name] = (
+                        'true' if form.cleaned_data.get(field_name) else 'false'
+                    )
+                jobs.append(dispatch_platform_build(
+                    selected_platform,
+                    version,
+                    full_url,
+                    inputs_raw,
+                    selfhosted,
+                ))
 
-            string_bytes = decodedCustomJson.encode("utf-8")
-            base64_bytes = base64.b64encode(string_bytes)
-            encodedCustom = base64_bytes.decode("ascii")
-
-            # #github limits inputs to 10, so lump extras into one with json
-            # extras = {}
-            # extras['genurl'] = _settings.GENURL
-            # #extras['runasadmin'] = runasadmin
-            # extras['urlLink'] = urlLink
-            # extras['downloadLink'] = downloadLink
-            # extras['delayFix'] = 'true' if delayFix else 'false'
-            # extras['rdgen'] = 'true'
-            # extras['cycleMonitor'] = 'true' if cycleMonitor else 'false'
-            # extras['xOffline'] = 'true' if xOffline else 'false'
-            # extras['removeNewVersionNotif'] = 'true' if removeNewVersionNotif else 'false'
-            # extras['compname'] = compname
-            # extras['androidappid'] = androidappid
-            # extra_input = json.dumps(extras)
-
-            ####from here run the github action, we need user, repo, access token.
-            workflow_file = {
-                'windows': 'sh-generator-windows.yml' if selfhosted else 'generator-windows.yml',
-                'windows-x86': 'generator-windows-x86.yml',
-                'linux': 'generator-linux.yml',
-                'android': 'generator-android.yml',
-                'macos': 'generator-macos.yml',
-            }.get(platform, 'generator-windows.yml')
-            url = (
-                f"https://api.github.com/repos/{_settings.GHUSER}/{_settings.REPONAME}"
-                f"/actions/workflows/{workflow_file}/dispatches"
-            )
-
-            #url = 'https://api.github.com/repos/'+_settings.GHUSER+'/rustdesk/actions/workflows/test.yml/dispatches'  
-            inputs_raw = {
-                "server":server,
-                "key":key,
-                "apiServer":apiServer,
-                "custom":encodedCustom,
-                "uuid":myuuid,
-                "iconlink_url":iconlink_url,
-                "iconlink_uuid":iconlink_uuid,
-                "iconlink_file":iconlink_file,
-                "logolink_url":logolink_url,
-                "logolink_uuid":logolink_uuid,
-                "logolink_file":logolink_file,
-                "privacylink_url":privacylink_url,
-                "privacylink_uuid":privacylink_uuid,
-                "privacylink_file":privacylink_file,
-                "appname":appname,
-                "genurl":_settings.GENURL,
-                "urlLink":urlLink,
-                "downloadLink":downloadLink,
-                "updateLink":updateLink,
-                "delayFix": 'true' if delayFix else 'false',
-                "rdgen":'true',
-                "cycleMonitor": 'true' if cycleMonitor else 'false',
-                "xOffline": 'true' if xOffline else 'false',
-                "removeNewVersionNotif": 'true' if removeNewVersionNotif else 'false',
-                "compname": compname,
-                "androidappid":androidappid,
-                "filename":filename,
-                "token": _settings.CALLBACK_TOKEN
-            }
-            for field_name in EXTRA_BOOLEAN_FIELDS:
-                inputs_raw[field_name] = 'true' if form.cleaned_data.get(field_name) else 'false'
-
-            temp_json_path = f"data_{uuid.uuid4()}.json"
-            zip_filename = f"secrets_{myuuid}_{uuid.uuid4()}.zip"
-            zip_path = "temp_zips/%s" % (zip_filename)
-            Path("temp_zips").mkdir(parents=True, exist_ok=True)
-
-            with open(temp_json_path, "w") as f:
-                json.dump(inputs_raw, f)
-
-            with pyzipper.AESZipFile(zip_path, 'w', compression=pyzipper.ZIP_LZMA, encryption=pyzipper.WZ_AES) as zf:
-                zf.setpassword(_settings.ZIP_PASSWORD.encode())
-                zf.write(temp_json_path, arcname="secrets.json")
-
-            if os.path.exists(temp_json_path):
-                os.remove(temp_json_path)
-
-            zipJson = {}
-            zipJson['url'] = full_url
-            zipJson['file'] = zip_filename
-            zipJson['token'] = build_zip_token(zip_filename)
-
-            zip_url = json.dumps(zipJson)
-
-            data = {
-                "ref":_settings.GHBRANCH,
-                "inputs":{
-                    "version":version,
-                    "zip_url":zip_url
-                },
-                "return_run_details": True
-            } 
-            #print(data)
-            headers = {
-                'Accept':  'application/vnd.github+json',
-                'Content-Type': 'application/json',
-                'Authorization': 'Bearer '+_settings.GHBEARER,
-                'X-GitHub-Api-Version': '2026-03-10'
-            }
-            new_github_run = GithubRun(
-                uuid=myuuid,
-                status="Starting generator...please wait"
-            )
-            try:
-                response = requests.post(url, json=data, headers=headers, timeout=30)
-                #print(response)
-                if response.status_code == 204 or response.status_code == 200:
-                    github_data = {}
-                    if response.content:
-                        try:
-                            github_data = response.json()
-                        except ValueError:
-                            github_data = {}
-                    if not github_data.get('workflow_run_id'):
-                        latest_run = get_latest_workflow_run(workflow_file, headers)
-                        github_data['workflow_run_id'] = latest_run.get('id')
-                        github_data['html_url'] = latest_run.get('html_url')
-                    if not github_data.get('workflow_run_id'):
-                        return JsonResponse({"error": "GitHub accepted the start request, but the workflow run could not be found yet. Please check Actions manually."}, status=202)
-                    new_github_run.github_run_id = github_data.get('workflow_run_id')
-                    new_github_run.status = "in_progress"
-                    new_github_run.save()
-
-                    return render(request, 'waiting.html', {'filename':filename, 'uuid':myuuid, 'status':"构建已启动，请稍候", 'platform':platform, 'log_url': github_data.get('html_url')})
-                else:
-                    #new_github_run.delete()
-                    return JsonResponse({"error": "GitHub rejected the start request", "detail": response.text}, status=500)
-            except Exception as e:
-                #new_github_run.delete()
-                return JsonResponse({"error": f"Connection error: {str(e)}"}, status=500)
+            if len(jobs) == 1 and jobs[0]['status'] == 'in_progress':
+                job = jobs[0]
+                return render(request, 'waiting.html', {
+                    'filename': filename,
+                    'uuid': job['uuid'],
+                    'status': '构建已启动，请稍候',
+                    'platform': job['platform'],
+                    'log_url': job['log_url'],
+                })
+            return render(request, 'batch_waiting.html', {
+                'filename': filename,
+                'jobs': jobs,
+            })
     else:
         form = GenerateForm()
     #return render(request, 'maintenance.html')
@@ -491,30 +552,40 @@ def generator_view(request):
 from django.shortcuts import render, get_object_or_404
 from django.db.models import Q
 
+
+def refresh_github_run(gh_run):
+    if gh_run.status in TERMINAL_STATUSES or not gh_run.github_run_id:
+        return gh_run
+    headers = {
+        'Authorization': f'Bearer {_settings.GHBEARER}',
+        'Accept': 'application/vnd.github+json',
+    }
+    api_url = (
+        f"https://api.github.com/repos/{_settings.GHUSER}/{_settings.REPONAME}"
+        f"/actions/runs/{gh_run.github_run_id}"
+    )
+    try:
+        response = requests.get(api_url, headers=headers, timeout=20)
+        if response.status_code == 200:
+            github_data = response.json()
+            new_status = github_data.get('status', gh_run.status)
+            if new_status == 'completed':
+                new_status = github_data.get('conclusion') or 'failure'
+            if new_status != gh_run.status:
+                gh_run.status = new_status
+                gh_run.save(update_fields=['status'])
+    except requests.RequestException as exc:
+        print(f'Error checking GitHub run {gh_run.github_run_id}: {exc}')
+    return gh_run
+
+
 def check_for_file(request):
     filename = request.GET.get('filename')
     uuid = safe_uuid(request.GET.get('uuid'))
     platform = request.GET.get('platform')
     gh_run = get_object_or_404(GithubRun, uuid=uuid)
     github_log_url = f"https://github.com/{_settings.GHUSER}/{_settings.REPONAME}/actions/runs/{gh_run.github_run_id}"
-
-    if gh_run.status not in ['success', 'failure', 'cancelled', 'timed_out', 'skipped']:
-        headers = {
-            "Authorization": f"Bearer {_settings.GHBEARER}",
-            "Accept": "application/vnd.github+json"
-        }
-        api_url = f"https://api.github.com/repos/{_settings.GHUSER}/{_settings.REPONAME}/actions/runs/{gh_run.github_run_id}"
-        
-        try:
-            gh_response = requests.get(api_url, headers=headers)
-            if gh_response.status_code == 200:
-                gh_data = gh_response.json()
-                
-                if gh_data['status'] == 'completed':
-                    gh_run.status = gh_data['conclusion']
-                    gh_run.save()
-        except Exception as e:
-            print(f"Error checking GitHub: {e}")
+    gh_run = refresh_github_run(gh_run)
     
     if gh_run.status == "success":
         return render(request, 'generated.html', {
@@ -541,6 +612,23 @@ def check_for_file(request):
             'platform': platform, 
             'log_url': github_log_url
         })
+
+
+def build_status(request):
+    build_uuid = safe_uuid(request.GET.get('uuid'))
+    gh_run = get_object_or_404(GithubRun, uuid=build_uuid)
+    gh_run = refresh_github_run(gh_run)
+    files = list_generated_files(build_uuid) if gh_run.status == 'success' else []
+    return JsonResponse({
+        'uuid': build_uuid,
+        'status': gh_run.status,
+        'terminal': gh_run.status in TERMINAL_STATUSES,
+        'files': files,
+        'log_url': (
+            f"https://github.com/{_settings.GHUSER}/{_settings.REPONAME}"
+            f"/actions/runs/{gh_run.github_run_id}"
+        ),
+    })
 
 def download(request):
     filename = os.path.basename(request.GET['filename'])

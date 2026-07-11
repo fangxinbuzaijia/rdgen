@@ -4,7 +4,8 @@
 
 - 中文主页面、等待页、成功页、失败页
 - 保存/加载 JSON 配置
-- 平台选择：Windows 64 位、Windows 32 位、Linux、Android、macOS
+- 平台多选批量构建：Windows 64 位、Windows 32 位、Linux、Android、macOS
+- 每个平台使用独立 UUID、Actions 运行记录、状态和下载目录，批次页统一展示进度与产物
 - 自定义服务器、Key、API、门户网站、下载链接、公司名
 - 自定义应用名、文件名、Android 包名
 - 图标、Logo、隐私屏幕图片上传和预览
